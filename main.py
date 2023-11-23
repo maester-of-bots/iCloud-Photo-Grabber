@@ -38,7 +38,6 @@ async def event_loop():
         global apple_login
 
         event, value = window.Read()
-        print(value.keys())
         if event in (sg.WIN_CLOSED, 'EXIT'):
             window.close()
             break
@@ -87,7 +86,6 @@ async def event_loop():
                 photos = apple_login.photos.albums['All Photos']
 
                 for photo in photos:
-                    print(photo)
 
                     newDate = adjust_apple_time(photo.created)
                     if newDate > timestamp:
