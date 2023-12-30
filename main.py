@@ -1,109 +1,190 @@
-import asyncio
+import os
+import threading
+import tkinter as tk
+from tkinter import PhotoImage
 
-import PySimpleGUI as sg
-from pyicloud import PyiCloudService
+import cv2
+import sv_ttk
+from tkcalendar import Calendar
 
-from modules.photos import *
+from modules.apple import ICB
 from modules.timestuff import *
 
-apple_login = None
-photos = None
 
+class iCloudPhotoGrabber(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("iCloud Photo Grabber")
+        self.geometry("300x400")
 
-async def event_loop():
+        self.extensions = {}
 
-    # Layout
-    layout = [
-        [sg.Frame('', [
-            [sg.Input(key='-INCAL1-', enable_events=True, visible=False), sg.CalendarButton('Select date', target='-INCAL1-', key='-CAL1-', format='%Y-%m-%d'), sg.Text('', key='-CALSTATUS-', size=(15,1))],
-    ], relief=sg.RELIEF_GROOVE, tooltip='Use the calendar to pick a date')],
-    [sg.HorizontalSeparator()],
+        self.iconbitmap(r'img\photo_icon.ico')
 
-        [sg.Frame('iCloud Login', [
-            [sg.Column([
-                [sg.Text('Username:', size=(10, 1)), sg.InputText(key='-USERNAME-', size=(20,1))],
-            [sg.Text('Password:', size=(10, 1)), sg.InputText(key='-PASSWORD-', password_char='*', size=(20,1))],
-            [sg.Button('Login', key='-LOGIN-', bind_return_key=True, button_color=('white', 'teal')), sg.Text('', key='-LOGIN-STATUS-', size=(15,1))]
-            ], element_justification='right')]
-        ], relief=sg.RELIEF_GROOVE)],
+        # Configure the grid
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
-    [sg.HorizontalSeparator()],
-    [sg.Frame('', [
-        [sg.Button('Download Photos', key='-DOWNLOAD-', size=(20,1), pad=((5,5),(10,10)), button_color=('white', 'gray'))],
-    ], relief=sg.RELIEF_GROOVE, tooltip='Download photos for the selected date')]
-    ]
-    window = sg.Window('iCloud Photo Grabber', size=(400, 400), resizable=True, finalize=True).Layout(layout).finalize()
+        # iCloud Login Frame
+        self.login_frame = tk.Frame(self)
+        self.login_frame.grid(row=0, column=0, sticky="nsew")
+        self.login_frame.grid_columnconfigure(0, weight=1)
 
-    while True:
-        global apple_login
+        # Username
+        tk.Label(self.login_frame, text="Username").grid(row=0, column=0)
+        self.username_input = tk.Entry(self.login_frame)
+        self.username_input.grid(row=1, column=0, pady=(0, 10))
 
-        event, value = window.Read()
-        if event in (sg.WIN_CLOSED, 'EXIT'):
-            window.close()
-            break
-        elif event == '-INCAL1-':
-            cal_set = True  # Placeholder for actual login status
-            window['-CALSTATUS-'].update('Date selected' if cal_set else 'Date missing',text_color=('white' if cal_set else 'red'))
-            window['-DOWNLOAD-'].update(button_color=('white', 'green'))
+        # Password
+        tk.Label(self.login_frame, text="Password").grid(row=2, column=0)
+        self.password_input = tk.Entry(self.login_frame, show="*")
+        self.password_input.grid(row=3, column=0, pady=(0, 10))
 
+        # Login buton
+        tk.Button(self.login_frame, text="Login", command=self.login_to_icloud).grid(row=4, column=0, pady=10)
 
-        elif event == '-LOGIN-':
-            logged_in = True  # Placeholder for actual login status
-            window['-LOGIN-STATUS-'].update('Logged In' if logged_in else 'Not Logged In',text_color=('white' if logged_in else 'red'))
-            username = value['-USERNAME-']
-            password = value['-PASSWORD-']
+        # Calendar Button (Hidden))
+        self.calendar_button = tk.Button(self, text="Select date", command=self.show_date_picker)
 
-            try:
-                apple_login = PyiCloudService(username, password)
-            except Exception as e:
-                print(e)
+        # Loading gif (Hidden, lazy)
+        self.loader_gif = 'img/loader.gif'
+        num_frames = 20
+        scale_factor = 2
+        self.loader_frames = [
+            PhotoImage(file=self.loader_gif, format=f'gif -index {i}').subsample(scale_factor)
+            for i in range(num_frames)
+        ]
+        self.loader_label = tk.Label(self)
+
+    def update_frame(self, frame_number=0):
+        frame = self.loader_frames[frame_number]
+        self.loader_label.configure(image=frame)
+        next_frame = (frame_number + 1) % len(self.loader_frames)
+        self.after(100, self.update_frame, next_frame)  # Adjust time for frame change
+
+    def show_loader(self):
+        self.loader_label.grid(row=1, column=0, pady=10)
+        self.update_frame()
+
+    def hide_loader(self):
+        self.loader_label.grid_remove()
+        tk.Label(self, text="Download complete.").grid(row=1, column=0)
+
+    def process_photos(self, timestamp):
+        photos = self.extensions['apple'].apple_login.photos.albums['All Photos']
+
+        for photo in photos:
+            newDate = adjust_apple_time(photo.created)
+            if newDate.date() >= timestamp:
+                self.process_photo(photo, newDate)
+            else:
                 break
 
-            if apple_login.requires_2fa:
-                security_code = sg.popup_get_text('Enter Security Code', 'iCloud Security Code')
-                result = apple_login.validate_2fa_code(security_code)
-                print("Code validation result: %s" % result)
-                if not result:
-                    print("Failed to verify security code")
-                    break
-                if not apple_login.is_trusted_session:
-                    print("Session is not trusted. Requesting trust...")
-                    result = apple_login.trust_session()
-                    print("Session trust result %s" % result)
-                    if not result:
-                        print(
-                            "Failed to request trust. You will likely be prompted for the code again in the coming weeks")
-            else:
-                print("Logged into iCloud.")
-                window['-DOWNLOAD-'].update(button_color=('white', 'green'))
+        self.hide_loader()
 
-        elif event == '-DOWNLOAD-':
-            try:
-                choice = value['-INCAL1-']
+    def on_close(self, cal, top):
+        timestamp = cal.selection_get()
+        top.destroy()
 
-                timestamp = convert_to_datetime(choice)
+        # Hide calendar button
+        self.calendar_button.grid_remove()
+        self.show_loader()
 
-                photos = apple_login.photos.albums['All Photos']
+        # Start the download process in a separate thread
+        threading.Thread(target=self.process_photos, args=(timestamp,), daemon=True).start()
 
-                for photo in photos:
+    def process_photo(self, photo, new_date):
+        """
+        Process and download a photo from iCloud.
 
-                    newDate = adjust_apple_time(photo.created)
-                    if newDate > timestamp:
-                        await process_photo(photo, newDate)
-                    else:
-                        break
+        Parameters:
+        photo (obj): The photo object to download.
+        new_date (datetime): The date for naming the downloaded file.
+        """
+        date_string = f"{new_date.year}-{new_date.month}-{new_date.day}"
 
-                print("All done!")
+        if not os.path.exists(date_string):
+            os.makedirs(date_string)
 
-            except Exception as e:
-                print(e)
+        extension = photo.versions['original']['filename'].split(".")[1]
+        filename = f"{date_string}/{new_date.month}-{new_date.day}-{new_date.year}-{new_date.hour}-{new_date.minute}-{new_date.second}-{new_date.microsecond}.{extension}"
 
+        if "heic" in photo.filename.lower():
+            download = photo.download('medium')
+            video_name = filename.replace('.HEIC', '.mov')
+            with open(video_name, 'wb') as file:
+                file.write(download.raw.read())
+            self.extract_first_frame(video_name)
+        else:
+            download = photo.download('original')
+            with open(filename, 'wb') as file:
+                file.write(download.raw.read())
 
-async def main():
+    def create_popup(self):
+        popup = tk.Toplevel(self)
+        popup.title("Input Required")
+        popup.geometry("300x100")
 
-    await asyncio.gather(event_loop())
+        tk.Label(popup, text="Enter your value:").pack(pady=5)
+
+        input_value = tk.StringVar()
+        input_field = tk.Entry(popup, textvariable=input_value)
+        input_field.pack(pady=5)
+
+        def on_submit():
+            popup.destroy()
+
+        submit_button = tk.Button(popup, text="Submit", command=on_submit)
+        submit_button.pack(pady=5)
+
+        # Focus on the input field and wait for the popup to close
+        input_field.focus_set()
+        popup.grab_set()
+        popup.wait_window()
+
+        return input_value.get()
+
+    def extract_first_frame(self, video_path):
+        """
+        Extract the first frame from a video file and save it as an image.
+
+        Parameters:
+        video_path (str): The path of the video file.
+
+        """
+        directory, filename = os.path.split(video_path)
+        name, _ = os.path.splitext(filename)
+        capture = cv2.VideoCapture(video_path)
+        success, image = capture.read()
+        if success:
+            cv2.imwrite(os.path.join(directory, f"{name}.jpg"), image)
+
+    def login_to_icloud(self):
+
+        username = self.username_input.get()
+        password = self.password_input.get()
+
+        ICB.init_app(app, username, password)
+
+        # Hide login frame
+        self.login_frame.grid_remove()
+
+        # Show calendar button
+        self.calendar_button.grid(row=0, column=0, pady=10)
+
+    def show_date_picker(self):
+        top = tk.Toplevel(self)
+        cal = Calendar(top, selectmode='day')
+        cal.pack(pady=20)
+
+        def handle_close():
+            self.calendar_button.grid_remove()  # Hide calendar button
+            self.on_close(cal, top)
+
+        tk.Button(top, text="OK", command=handle_close).pack()
 
 
 if __name__ == "__main__":
-
-    asyncio.run(main())
+    app = iCloudPhotoGrabber()
+    sv_ttk.set_theme("light")
+    app.mainloop()
